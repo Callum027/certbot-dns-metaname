@@ -99,7 +99,6 @@ class Authenticator(dns_common.DNSAuthenticator):
         super().__init__(*args, **kwargs)
         self.auth = None
         self.metaname_client = None
-        self.created_record_reference = None
 
     def more_info(self):
         return self.__doc__
@@ -184,7 +183,7 @@ class Authenticator(dns_common.DNSAuthenticator):
 
         domain_name = self._metaname_domain_name_for_hostname(validation_name)
         try:
-            response = self._metaname_client().request(
+            self._metaname_client().request(
                 "create_dns_record",
                 domain_name,
                 self._txt_record(f"{validation_name}.", validation),
@@ -193,27 +192,44 @@ class Authenticator(dns_common.DNSAuthenticator):
             raise errors.PluginError(
                 f"Unable to create an acme-challenge record in the zone {domain}: {e}"
             ) from e
-        else:
-            self.created_record_reference = response
 
     def _cleanup(self, domain, validation_name, validation):
         """
-        Removes the TXT record created by _perform. This must be called after _perform so that the record ID to be deleted is known.
+        Removes the TXT record created by _perform.
         """
 
-        if self.created_record_reference is None:
-            raise errors.PluginError(
-                "Cannot clean up DNS because the record hasn't been created yet"
-            )
-
+        # Get the parent domain name for the validation hostname.
+        # Used whe querying the Metaname API.
         domain_name = self._metaname_domain_name_for_hostname(validation_name)
+        # Query the Metaname API to find the reference value for the TXT record
+        # created.
+        resource_records = self._metaname_client().request("dns_zone", domain_name)
+        for record in resource_records:
+            if record["name"] == f"{validation_name}.":
+                # Run some sanity checks to make sure we are removing the correct record.
+                if record["type"] != "TXT":
+                    raise errors.PluginError(
+                        "Cannot clean up DNS record: incorrect record type: "
+                        f"found '{record['type']}, expected 'TXT'"
+                    )
+                if record["data"] != validation:
+                    raise errors.PluginError(
+                        "Cannot clean up DNS record: incorrect validation value: "
+                        f"found '{record['data']}, expected '{validation}'"
+                    )
+                # We have found the correct record, so set
+                # the reference value and stop iterating.
+                record_reference = record["reference"]
+                break
+        # Unable to find the TXT record: assume it has already been deleted and stop here.
+        else:
+            return
+        # Delete the TXT record using its API reference.
         try:
             self._metaname_client().request(
-                "delete_dns_record", domain_name, self.created_record_reference
+                "delete_dns_record", domain_name, record_reference
             )
         except Exception as e:
             raise errors.PluginError(
                 f"Unable to delete the acme-challenge record in the zone {domain}: {e}"
             ) from e
-        else:
-            self.created_record_reference = None
